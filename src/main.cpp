@@ -211,6 +211,37 @@ $on_mod(Loaded) {
                 return ListenerResult::Stop;
             }
         }
+
+        // AndroidRichInputEvent is sent before Geode forwards the MotionEvent
+        // into Cocos. Handle the egui overlay here, so UI input does not depend
+        // on hooking CCTouchDispatcher's internal dispatch method.
+        if (auto* touch = std::get_if<AndroidTouchInput>(&input)) {
+            auto const& points = touch->touches();
+            if (!points.empty()) {
+                // Geode 5.11.2's Android input implementation currently
+                // pre-sizes this vector and then emplaces the same points,
+                // leaving a zero-initialized prefix followed by real points.
+                // Use the real second half for this SDK version.
+                auto firstActualPoint = points.size();
+                if (points.size() % 2 == 0) {
+                    firstActualPoint = points.size() / 2;
+                }
+
+                auto action = static_cast<uint8_t>(touch->type());
+                bool consumed = false;
+                for (auto i = firstActualPoint; i < points.size(); ++i) {
+                    auto const& point = points[i];
+                    if (zcblive_on_touch(action, point.id, point.x, point.y)) {
+                        consumed = true;
+                    }
+                }
+
+                if (consumed) {
+                    return ListenerResult::Stop;
+                }
+            }
+        }
+
         return ListenerResult::Propagate;
     }).leak();
 
