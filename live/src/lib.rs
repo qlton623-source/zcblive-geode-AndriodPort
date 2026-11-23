@@ -36,10 +36,6 @@ unsafe extern "C" fn zcblive_on_swap_buffers(width: u32, height: u32) {
     ) {
         log::error!("paint_gles() failed: {e}");
     }
-
-    // Keep touch capture in sync with the menu visibility after egui
-    // has processed this frame.
-    egui_gl_hook::set_capture_all_touches(!BOT.conf.hidden);
 }
 
 #[no_mangle]
