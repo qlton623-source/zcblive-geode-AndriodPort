@@ -720,11 +720,17 @@ pub fn on_touch(action: u8, pointer_id: i32, x: f32, y: f32) -> bool {
 
             state.active_pointer = None;
 
-            // While the main menu is open, capture touches even if
-            // egui's layer hit-test fails to identify the window.
-            if !state.capture_all_touches
-                && state.egui_ctx.layer_id_at(pos).is_none()
-            {
+            // egui registers a full-screen background layer every frame.
+            // Therefore `layer_id_at(pos).is_some()` is NOT enough to know
+            // that the touch is over our UI: outside every window it returns
+            // `LayerId::background()`. Treat that layer exactly like no hit,
+            // otherwise every Android touch is consumed and Geometry Dash's
+            // own buttons never receive it.
+            let hit_layer = state.egui_ctx.layer_id_at(pos);
+            let is_over_egui_ui = hit_layer
+                .is_some_and(|layer| layer != egui::LayerId::background());
+
+            if !state.capture_all_touches && !is_over_egui_ui {
                 return false;
             }
 
