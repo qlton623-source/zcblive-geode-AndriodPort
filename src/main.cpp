@@ -1,7 +1,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
-#include <Geode/cocos/shaders/ccGLStateCache.h>
 #include <Geode/modify/CCDirector.hpp>
+#include <Geode/modify/CCEGLView.hpp>
 #include <Geode/modify/CCIMEDispatcher.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <Geode/modify/CCTouchDispatcher.hpp>
@@ -15,6 +15,7 @@
 #include <Geode/utils/general.hpp>
 #include <Geode/utils/web.hpp>
 
+#include <atomic>
 #include <cstdlib>
 #include <string>
 #include <variant>
@@ -56,6 +57,7 @@ void zcblive_on_update(float dt);
 
 namespace {
 bool g_fmodReady = false;
+std::atomic<void*> g_pendingFmodSystem{nullptr};
 
 void onOpenUrl(const char* url) {
     if (url && *url) {
@@ -82,44 +84,64 @@ void onImeToggle(bool open) {
 }
 } // namespace
 
-// Capture Geometry Dash's own FMOD::System as soon as it finishes initializing.
+// Capture Geometry Dash's FMOD system, but do not touch Rust's global BOT
+// from the thread that initializes FMOD. Publish the pointer atomically and
+// attach to it from CCDirector::drawScene on the game/render thread.
 // clang-format off
 class $modify(ZcbFMODSystem, FMOD::System) {
     FMOD_RESULT init(int maxChannels, FMOD_INITFLAGS flags, void* extraData) {
         FMOD_RESULT res = FMOD::System::init(maxChannels, flags, extraData);
         if (res == FMOD_OK) {
-            g_fmodReady = true;
-            zcblive_on_fmod_ready(static_cast<void*>(this));
+            g_pendingFmodSystem.store(static_cast<void*>(this), std::memory_order_release);
         }
         return res;
     }
 };
 
-// On Android, CCEGLView::swapBuffers() is managed by GLSurfaceView in Java,
-// so hook CCDirector::drawScene() to render the egui overlay right after the
-// scene finishes drawing and before GLSurfaceView swaps buffers.
 class $modify(ZcbDirector, CCDirector) {
     void drawScene() {
         CCDirector::drawScene();
 
         if (!g_fmodReady) {
-            if (auto* engine = FMODAudioEngine::get()) {
-                if (engine->m_system) {
-                    g_fmodReady = true;
-                    zcblive_on_fmod_ready(static_cast<void*>(engine->m_system));
+            void* system = g_pendingFmodSystem.exchange(nullptr, std::memory_order_acq_rel);
+            if (!system) {
+                if (auto* engine = FMODAudioEngine::get()) {
+                    if (engine->m_system) {
+                        system = static_cast<void*>(engine->m_system);
+                    }
                 }
             }
-        }
 
-        if (auto* view = CCEGLView::get()) {
-            auto frameSize = view->getFrameSize();
-            auto w = static_cast<uint32_t>(frameSize.width > 1.0f ? frameSize.width : 1.0f);
-            auto h = static_cast<uint32_t>(frameSize.height > 1.0f ? frameSize.height : 1.0f);
-            zcblive_on_swap_buffers(w, h);
-            cocos2d::ccGLInvalidateStateCache();
+            if (system) {
+                g_fmodReady = true;
+                zcblive_on_fmod_ready(system);
+            }
         }
     }
 };
+
+// Android's CCEGLView::swapBuffers() is intentionally empty because
+// GLSurfaceView presents after the native draw callback returns. Cocos still
+// calls this at the end of CCDirector::drawScene(), while EGL is current.
+class $modify(ZcbEGLView, CCEGLView) {
+    void swapBuffers() {
+        auto frameSize = this->getFrameSize();
+        const auto width = static_cast<uint32_t>(
+            frameSize.width > 1.0f ? frameSize.width : 1.0f
+        );
+        const auto height = static_cast<uint32_t>(
+            frameSize.height > 1.0f ? frameSize.height : 1.0f
+        );
+
+        zcblive_on_swap_buffers(width, height);
+
+        // egui_glow saves and restores the GLES state it changes. Do not call
+        // ccGLInvalidateStateCache(): on the GD Cocos fork it also calls
+        // kmGLFreeAll(), destroying Cocos' projection/model-view stacks.
+        CCEGLView::swapBuffers();
+    }
+};
+// clang-format on
 
 class $modify(ZcbTouchDispatcher, CCTouchDispatcher) {
     void touches(CCSet* pTouches, CCEvent* pEvent, unsigned int uIndex) {
@@ -265,102 +287,102 @@ void handleAction(int button, bool player1, bool push, PlayLayer* playLayer) {
 
 // clang-format off
 class $modify(PlayerObject) {
-	void handlePushOrRelease(PlayerButton button, bool push) {
-		auto playLayer = PlayLayer::get();
-		if (playLayer == nullptr && LevelEditorLayer::get() == nullptr) {
-			zcblive_set_is_in_level(false);
-			return;
-		}
-		if ((button == PlayerButton::Left || button == PlayerButton::Right) && !this->m_isPlatformer) {
-			return;
-		}
+    void handlePushOrRelease(PlayerButton button, bool push) {
+        auto playLayer = PlayLayer::get();
+        if (playLayer == nullptr && LevelEditorLayer::get() == nullptr) {
+            zcblive_set_is_in_level(false);
+            return;
+        }
+        if ((button == PlayerButton::Left || button == PlayerButton::Right) && !this->m_isPlatformer) {
+            return;
+        }
 
-		zcblive_set_is_in_level(true);
-		zcblive_set_playlayer_time(getTime());
+        zcblive_set_is_in_level(true);
+        zcblive_set_playlayer_time(getTime());
 
-		bool player1 = playLayer && this == playLayer->m_player1;
-		handleAction(static_cast<int>(button), player1, push, playLayer);
-	}
+        bool player1 = playLayer && this == playLayer->m_player1;
+        handleAction(static_cast<int>(button), player1, push, playLayer);
+    }
 
-	bool pushButton(PlayerButton button) {
-		if (zcblive_do_use_alternate_hook()) {
-			handlePushOrRelease(button, true);
-		}
-		return PlayerObject::pushButton(button);
-	}
+    bool pushButton(PlayerButton button) {
+        if (zcblive_do_use_alternate_hook()) {
+            handlePushOrRelease(button, true);
+        }
+        return PlayerObject::pushButton(button);
+    }
 
-	bool releaseButton(PlayerButton button) {
-		if (zcblive_do_use_alternate_hook()) {
-			handlePushOrRelease(button, false);
-		}
-		return PlayerObject::releaseButton(button);
-	}
+    bool releaseButton(PlayerButton button) {
+        if (zcblive_do_use_alternate_hook()) {
+            handlePushOrRelease(button, false);
+        }
+        return PlayerObject::releaseButton(button);
+    }
 };
 
 class $modify(GJBaseGameLayer) {
-	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-		bool lastDied = m_playerDied;
-		m_playerDied = false;
-		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-		m_playerDied = lastDied;
-	}
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        bool lastDied = m_playerDied;
+        m_playerDied = false;
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        m_playerDied = lastDied;
+    }
 
-	void handleButton(bool push, int button, bool player1) {
-		if (zcblive_do_use_alternate_hook()) {
-			GJBaseGameLayer::handleButton(push, button, player1);
-			return;
-		}
-		zcblive_set_is_in_level(true);
-		zcblive_set_playlayer_time(getTime());
+    void handleButton(bool push, int button, bool player1) {
+        if (zcblive_do_use_alternate_hook()) {
+            GJBaseGameLayer::handleButton(push, button, player1);
+            return;
+        }
+        zcblive_set_is_in_level(true);
+        zcblive_set_playlayer_time(getTime());
 
-		auto playLayer = PlayLayer::get();
-		bool p1Plat = playLayer && playLayer->m_player1 && playLayer->m_player1->m_isPlatformer;
-		bool p2Plat = playLayer && playLayer->m_player2 && playLayer->m_player2->m_isPlatformer;
-		bool is_invalid = playLayer && ((button == 2 || button == 3)
-				&& !(player1 && p1Plat)
-				&& !(!player1 && p2Plat));
-		if (!is_invalid) {
-			handleAction(button, player1, push, playLayer);
-		}
+        auto playLayer = PlayLayer::get();
+        bool p1Plat = playLayer && playLayer->m_player1 && playLayer->m_player1->m_isPlatformer;
+        bool p2Plat = playLayer && playLayer->m_player2 && playLayer->m_player2->m_isPlatformer;
+        bool is_invalid = playLayer && ((button == 2 || button == 3)
+                && !(player1 && p1Plat)
+                && !(!player1 && p2Plat));
+        if (!is_invalid) {
+            handleAction(button, player1, push, playLayer);
+        }
 
-		GJBaseGameLayer::handleButton(push, button, player1);
-	}
+        GJBaseGameLayer::handleButton(push, button, player1);
+    }
 
-	void update(float dt) {
-		zcblive_on_update(dt);
-		GJBaseGameLayer::update(dt);
-		zcblive_set_playlayer_time(getTime());
-	}
+    void update(float dt) {
+        zcblive_on_update(dt);
+        GJBaseGameLayer::update(dt);
+        zcblive_set_playlayer_time(getTime());
+    }
 
-	bool init() {
-		zcblive_on_init(nullptr); // PlayLayer* could be nullptr on Geode
-		return GJBaseGameLayer::init();
-	}
+    bool init() {
+        zcblive_on_init(nullptr); // PlayLayer* could be nullptr on Geode
+        return GJBaseGameLayer::init();
+    }
 };
 
 class $modify(PlayLayer) {
-	void onQuit() {
-		zcblive_on_quit();
-		PlayLayer::onQuit();
-	}
+    void onQuit() {
+        zcblive_on_quit();
+        PlayLayer::onQuit();
+    }
 
-	void resetLevel() {
-		zcblive_on_reset();
-		PlayLayer::resetLevel();
-	}
+    void resetLevel() {
+        zcblive_on_reset();
+        PlayLayer::resetLevel();
+    }
 
-	void destroyPlayer(PlayerObject* player, GameObject* hit) {
-		PlayLayer::destroyPlayer(player, hit);
-		if (player && player->m_isDead) {
-			zcblive_on_death();
-		}
-	}
+    void destroyPlayer(PlayerObject* player, GameObject* hit) {
+        PlayLayer::destroyPlayer(player, hit);
+        if (player && player->m_isDead) {
+            zcblive_on_death();
+        }
+    }
 };
 
 class $modify(LevelEditorLayer) {
-	bool init(GJGameLevel* level, bool something) {
-		zcblive_on_init(nullptr);
-		return LevelEditorLayer::init(level, something);
-	}
+    bool init(GJGameLevel* level, bool something) {
+        zcblive_on_init(nullptr);
+        return LevelEditorLayer::init(level, something);
+    }
 };
 // clang-format on
