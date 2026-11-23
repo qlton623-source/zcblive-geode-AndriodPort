@@ -27,6 +27,14 @@ pub fn set_ime_callback(cb: BoolCallback) {
     unsafe { IME_CB = Some(cb) };
 }
 
+pub fn set_capture_all_touches(capture: bool) {
+    unsafe {
+        if let Some(state) = &mut STATE {
+            state.capture_all_touches = capture;
+        }
+    }
+}
+
 // These are the GLES entry points needed to save state that glow 0.13.1 does not
 // expose through HasContext. GLboolean is an unsigned byte in GLES.
 type EglGetProcAddressFn = unsafe extern "C" fn(*const c_char) -> *const c_void;
@@ -132,6 +140,8 @@ struct EguiGlesState {
     native_ppp: f32,
     last_total_ppp: f32,
     active_pointer: Option<i32>,
+    active_pos: Option<Pos2>,
+    capture_all_touches: bool,
     is_changing_scale: bool,
     prev_scale: f32,
     ime_open: bool,
@@ -563,6 +573,8 @@ pub unsafe fn init_gles(width: u32, height: u32) -> Result<(), Error> {
         native_ppp,
         last_total_ppp: native_ppp,
         active_pointer: None,
+        active_pos: None,
+        capture_all_touches: false,
         is_changing_scale: false,
         prev_scale: 1.0,
         ime_open: false,
