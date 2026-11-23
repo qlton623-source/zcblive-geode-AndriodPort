@@ -2,7 +2,7 @@ use crate::Error;
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, ViewportId, ViewportInfo};
 use egui_glow::glow::{self, HasContext};
 use std::{
-    ffi::{c_char, c_void, CString},
+    ffi::{c_char, c_void, CStr, CString},
     num::NonZeroU32,
     sync::Arc,
     time::Instant,
@@ -27,10 +27,105 @@ pub fn set_ime_callback(cb: BoolCallback) {
     unsafe { IME_CB = Some(cb) };
 }
 
+// These are the GLES entry points needed to save state that glow 0.13.1 does not
+// expose through HasContext. GLboolean is an unsigned byte in GLES.
+type EglGetProcAddressFn = unsafe extern "C" fn(*const c_char) -> *const c_void;
+type GlGetBooleanvFn = unsafe extern "C" fn(u32, *mut u8);
+type GlGetVertexAttribivFn = unsafe extern "C" fn(u32, u32, *mut i32);
+type GlGetVertexAttribPointervFn = unsafe extern "C" fn(u32, u32, *mut *mut c_void);
+type GlVertexAttribPointerFn = unsafe extern "C" fn(u32, i32, u32, u8, i32, *const c_void);
+
+const GL_VERTEX_ATTRIB_ARRAY_ENABLED: u32 = 0x8622;
+const GL_VERTEX_ATTRIB_ARRAY_SIZE: u32 = 0x8623;
+const GL_VERTEX_ATTRIB_ARRAY_STRIDE: u32 = 0x8624;
+const GL_VERTEX_ATTRIB_ARRAY_TYPE: u32 = 0x8625;
+const GL_VERTEX_ATTRIB_ARRAY_NORMALIZED: u32 = 0x886A;
+const GL_VERTEX_ATTRIB_ARRAY_POINTER: u32 = 0x8645;
+const GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: u32 = 0x889F;
+
+#[derive(Clone, Copy)]
+struct GlStateApi {
+    get_booleanv: Option<GlGetBooleanvFn>,
+    get_vertex_attribiv: Option<GlGetVertexAttribivFn>,
+    get_vertex_attrib_pointerv: Option<GlGetVertexAttribPointervFn>,
+    vertex_attrib_pointer: Option<GlVertexAttribPointerFn>,
+}
+
+#[derive(Clone, Copy)]
+struct GlStateCaps {
+    has_vertex_arrays: bool,
+    has_framebuffer_srgb: bool,
+    max_vertex_attribs: u32,
+}
+
+unsafe fn load_gl_symbol(
+    name: &CStr,
+    lib_gles: *mut c_void,
+    egl_get_proc: Option<EglGetProcAddressFn>,
+) -> *const c_void {
+    if !lib_gles.is_null() {
+        let symbol = libc::dlsym(lib_gles, name.as_ptr());
+        if !symbol.is_null() {
+            return symbol as *const c_void;
+        }
+    }
+
+    if let Some(get_proc) = egl_get_proc {
+        let symbol = get_proc(name.as_ptr());
+        if !symbol.is_null() {
+            return symbol;
+        }
+    }
+
+    libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) as *const c_void
+}
+
+unsafe fn load_gl_state_api(
+    lib_gles: *mut c_void,
+    egl_get_proc: Option<EglGetProcAddressFn>,
+) -> GlStateApi {
+    let get_booleanv = load_gl_symbol(c"glGetBooleanv", lib_gles, egl_get_proc);
+    let get_vertex_attribiv = load_gl_symbol(c"glGetVertexAttribiv", lib_gles, egl_get_proc);
+    let get_vertex_attrib_pointerv =
+        load_gl_symbol(c"glGetVertexAttribPointerv", lib_gles, egl_get_proc);
+    let vertex_attrib_pointer =
+        load_gl_symbol(c"glVertexAttribPointer", lib_gles, egl_get_proc);
+
+    GlStateApi {
+        get_booleanv: if get_booleanv.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*const c_void, GlGetBooleanvFn>(get_booleanv))
+        },
+        get_vertex_attribiv: if get_vertex_attribiv.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*const c_void, GlGetVertexAttribivFn>(get_vertex_attribiv))
+        },
+        get_vertex_attrib_pointerv: if get_vertex_attrib_pointerv.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<
+                *const c_void,
+                GlGetVertexAttribPointervFn,
+            >(get_vertex_attrib_pointerv))
+        },
+        vertex_attrib_pointer: if vertex_attrib_pointer.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*const c_void, GlVertexAttribPointerFn>(
+                vertex_attrib_pointer,
+            ))
+        },
+    }
+}
+
 struct EguiGlesState {
     egui_ctx: egui::Context,
     painter: egui_glow::Painter,
     gl: Arc<glow::Context>,
+    gl_api: GlStateApi,
+    gl_caps: GlStateCaps,
     events: Vec<egui::Event>,
     start_time: Instant,
     screen_size: (u32, u32),
@@ -80,6 +175,318 @@ fn compute_native_ppp(height: u32) -> f32 {
     (height as f32 / 500.0).clamp(1.25, 3.5)
 }
 
+// Match egui_glow 0.27.2's own VAO detection. When GLES2 has no
+// OES_vertex_array_object, egui_glow emulates a VAO by changing global vertex
+// attribute pointers/enables, so those must be explicitly saved and restored.
+fn supports_vertex_arrays(gl: &glow::Context) -> bool {
+    const WEBGL_PREFIX: &str = "WebGL ";
+    const OPENGL_ES_PREFIX: &str = "OpenGL ES ";
+
+    let version_string = unsafe { gl.get_parameter_string(glow::VERSION) };
+
+    if let Some(pos) = version_string.rfind(WEBGL_PREFIX) {
+        let version_str = &version_string[pos + WEBGL_PREFIX.len()..];
+        if version_str.contains("1.0") {
+            let extensions = gl.supported_extensions();
+            extensions.contains("OES_vertex_array_object")
+                || extensions.contains("GL_OES_vertex_array_object")
+        } else {
+            true
+        }
+    } else if version_string.contains(OPENGL_ES_PREFIX) {
+        if version_string.contains("2.0") {
+            let extensions = gl.supported_extensions();
+            extensions.contains("OES_vertex_array_object")
+                || extensions.contains("GL_OES_vertex_array_object")
+        } else {
+            true
+        }
+    } else if version_string.starts_with('2') {
+        let extensions = gl.supported_extensions();
+        extensions.contains("ARB_vertex_array_object")
+            || extensions.contains("GL_ARB_vertex_array_object")
+    } else {
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VertexAttribSnapshot {
+    index: u32,
+    enabled: bool,
+    size: i32,
+    data_type: u32,
+    normalized: bool,
+    stride: i32,
+    buffer_binding: i32,
+    pointer: *mut c_void,
+}
+
+struct GlStateSnapshot {
+    program: i32,
+    vertex_array: Option<i32>,
+    vertex_attribs: Option<Vec<VertexAttribSnapshot>>,
+    array_buffer: i32,
+    element_array_buffer: i32,
+    active_texture: i32,
+    active_texture_binding: i32,
+    texture0_binding: i32,
+    unpack_alignment: i32,
+    viewport: [i32; 4],
+    scissor_box: [i32; 4],
+    color_mask: [bool; 4],
+    scissor_test: bool,
+    blend: bool,
+    cull_face: bool,
+    depth_test: bool,
+    stencil_test: bool,
+    blend_src_rgb: i32,
+    blend_dst_rgb: i32,
+    blend_src_alpha: i32,
+    blend_dst_alpha: i32,
+    blend_eq_rgb: i32,
+    blend_eq_alpha: i32,
+    framebuffer_srgb: Option<bool>,
+}
+
+unsafe fn save_vertex_attribs(
+    api: &GlStateApi,
+    max_vertex_attribs: u32,
+) -> Option<Vec<VertexAttribSnapshot>> {
+    let get_attrib = api.get_vertex_attribiv?;
+    let get_pointer = api.get_vertex_attrib_pointerv?;
+
+    let mut attributes = Vec::with_capacity(max_vertex_attribs as usize);
+
+    for index in 0..max_vertex_attribs {
+        let mut enabled = 0;
+        let mut size = 4;
+        let mut data_type = glow::FLOAT as i32;
+        let mut normalized = 0;
+        let mut stride = 0;
+        let mut buffer_binding = 0;
+        let mut pointer: *mut c_void = std::ptr::null_mut();
+
+        get_attrib(index, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &mut enabled);
+        get_attrib(index, GL_VERTEX_ATTRIB_ARRAY_SIZE, &mut size);
+        get_attrib(index, GL_VERTEX_ATTRIB_ARRAY_TYPE, &mut data_type);
+        get_attrib(index, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &mut normalized);
+        get_attrib(index, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &mut stride);
+        get_attrib(index, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &mut buffer_binding);
+        get_pointer(index, GL_VERTEX_ATTRIB_ARRAY_POINTER, &mut pointer);
+
+        attributes.push(VertexAttribSnapshot {
+            index,
+            enabled: enabled != 0,
+            size,
+            data_type: data_type as u32,
+            normalized: normalized != 0,
+            stride,
+            buffer_binding,
+            pointer,
+        });
+    }
+
+    Some(attributes)
+}
+
+unsafe fn restore_vertex_attribs(
+    gl: &glow::Context,
+    api: &GlStateApi,
+    attributes: &[VertexAttribSnapshot],
+) {
+    let Some(vertex_attrib_pointer) = api.vertex_attrib_pointer else {
+        return;
+    };
+
+    for attribute in attributes {
+        gl.bind_buffer(
+            glow::ARRAY_BUFFER,
+            NonZeroU32::new(attribute.buffer_binding as u32).map(glow::NativeBuffer),
+        );
+        vertex_attrib_pointer(
+            attribute.index,
+            attribute.size,
+            attribute.data_type,
+            attribute.normalized as u8,
+            attribute.stride,
+            attribute.pointer as *const c_void,
+        );
+        if attribute.enabled {
+            gl.enable_vertex_attrib_array(attribute.index);
+        } else {
+            gl.disable_vertex_attrib_array(attribute.index);
+        }
+    }
+}
+
+unsafe fn save_gl_state(
+    gl: &glow::Context,
+    api: &GlStateApi,
+    caps: &GlStateCaps,
+) -> GlStateSnapshot {
+    let mut viewport = [0i32; 4];
+    let mut scissor_box = [0i32; 4];
+    gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
+    gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut scissor_box);
+
+    let vertex_array = if caps.has_vertex_arrays {
+        Some(gl.get_parameter_i32(glow::VERTEX_ARRAY_BINDING))
+    } else {
+        None
+    };
+
+    let vertex_attribs = if vertex_array.is_none() {
+        save_vertex_attribs(api, caps.max_vertex_attribs)
+    } else {
+        None
+    };
+
+    let mut color_mask_bytes = [0u8; 4];
+    if let Some(get_booleanv) = api.get_booleanv {
+        get_booleanv(glow::COLOR_WRITEMASK, color_mask_bytes.as_mut_ptr());
+    }
+
+    let active_texture = gl.get_parameter_i32(glow::ACTIVE_TEXTURE);
+    let active_texture_binding = gl.get_parameter_i32(glow::TEXTURE_BINDING_2D);
+    gl.active_texture(glow::TEXTURE0);
+    let texture0_binding = gl.get_parameter_i32(glow::TEXTURE_BINDING_2D);
+    gl.active_texture(active_texture as u32);
+
+    let framebuffer_srgb = if caps.has_framebuffer_srgb {
+        Some(gl.is_enabled(glow::FRAMEBUFFER_SRGB))
+    } else {
+        None
+    };
+
+    GlStateSnapshot {
+        program: gl.get_parameter_i32(glow::CURRENT_PROGRAM),
+        vertex_array,
+        vertex_attribs,
+        array_buffer: gl.get_parameter_i32(glow::ARRAY_BUFFER_BINDING),
+        element_array_buffer: gl.get_parameter_i32(glow::ELEMENT_ARRAY_BUFFER_BINDING),
+        active_texture,
+        active_texture_binding,
+        texture0_binding,
+        unpack_alignment: gl.get_parameter_i32(glow::UNPACK_ALIGNMENT),
+        viewport,
+        scissor_box,
+        color_mask: color_mask_bytes.map(|value| value != 0),
+        scissor_test: gl.is_enabled(glow::SCISSOR_TEST),
+        blend: gl.is_enabled(glow::BLEND),
+        cull_face: gl.is_enabled(glow::CULL_FACE),
+        depth_test: gl.is_enabled(glow::DEPTH_TEST),
+        stencil_test: gl.is_enabled(glow::STENCIL_TEST),
+        blend_src_rgb: gl.get_parameter_i32(glow::BLEND_SRC_RGB),
+        blend_dst_rgb: gl.get_parameter_i32(glow::BLEND_DST_RGB),
+        blend_src_alpha: gl.get_parameter_i32(glow::BLEND_SRC_ALPHA),
+        blend_dst_alpha: gl.get_parameter_i32(glow::BLEND_DST_ALPHA),
+        blend_eq_rgb: gl.get_parameter_i32(glow::BLEND_EQUATION_RGB),
+        blend_eq_alpha: gl.get_parameter_i32(glow::BLEND_EQUATION_ALPHA),
+        framebuffer_srgb,
+    }
+}
+
+unsafe fn restore_gl_state(gl: &glow::Context, api: &GlStateApi, state: &GlStateSnapshot) {
+    gl.use_program(NonZeroU32::new(state.program as u32).map(glow::NativeProgram));
+
+    if let Some(vao) = state.vertex_array {
+        gl.bind_vertex_array(NonZeroU32::new(vao as u32).map(glow::NativeVertexArray));
+    }
+
+    if let Some(attributes) = &state.vertex_attribs {
+        restore_vertex_attribs(gl, api, attributes);
+    }
+
+    gl.bind_buffer(
+        glow::ARRAY_BUFFER,
+        NonZeroU32::new(state.array_buffer as u32).map(glow::NativeBuffer),
+    );
+    gl.bind_buffer(
+        glow::ELEMENT_ARRAY_BUFFER,
+        NonZeroU32::new(state.element_array_buffer as u32).map(glow::NativeBuffer),
+    );
+
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(
+        glow::TEXTURE_2D,
+        NonZeroU32::new(state.texture0_binding as u32).map(glow::NativeTexture),
+    );
+    if state.active_texture as u32 != glow::TEXTURE0 {
+        gl.active_texture(state.active_texture as u32);
+        gl.bind_texture(
+            glow::TEXTURE_2D,
+            NonZeroU32::new(state.active_texture_binding as u32).map(glow::NativeTexture),
+        );
+    }
+    gl.active_texture(state.active_texture as u32);
+
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, state.unpack_alignment.max(1));
+    gl.viewport(
+        state.viewport[0],
+        state.viewport[1],
+        state.viewport[2],
+        state.viewport[3],
+    );
+    gl.scissor(
+        state.scissor_box[0],
+        state.scissor_box[1],
+        state.scissor_box[2],
+        state.scissor_box[3],
+    );
+    gl.color_mask(
+        state.color_mask[0],
+        state.color_mask[1],
+        state.color_mask[2],
+        state.color_mask[3],
+    );
+
+    if state.scissor_test {
+        gl.enable(glow::SCISSOR_TEST);
+    } else {
+        gl.disable(glow::SCISSOR_TEST);
+    }
+    if state.blend {
+        gl.enable(glow::BLEND);
+    } else {
+        gl.disable(glow::BLEND);
+    }
+    if state.cull_face {
+        gl.enable(glow::CULL_FACE);
+    } else {
+        gl.disable(glow::CULL_FACE);
+    }
+    if state.depth_test {
+        gl.enable(glow::DEPTH_TEST);
+    } else {
+        gl.disable(glow::DEPTH_TEST);
+    }
+    if state.stencil_test {
+        gl.enable(glow::STENCIL_TEST);
+    } else {
+        gl.disable(glow::STENCIL_TEST);
+    }
+
+    gl.blend_func_separate(
+        state.blend_src_rgb as u32,
+        state.blend_dst_rgb as u32,
+        state.blend_src_alpha as u32,
+        state.blend_dst_alpha as u32,
+    );
+    gl.blend_equation_separate(
+        state.blend_eq_rgb as u32,
+        state.blend_eq_alpha as u32,
+    );
+
+    if let Some(enabled) = state.framebuffer_srgb {
+        if enabled {
+            gl.enable(glow::FRAMEBUFFER_SRGB);
+        } else {
+            gl.disable(glow::FRAMEBUFFER_SRGB);
+        }
+    }
+}
+
 pub unsafe fn init_gles(width: u32, height: u32) -> Result<(), Error> {
     if is_init() {
         return Err(Error::AlreadyInit);
@@ -88,35 +495,57 @@ pub unsafe fn init_gles(width: u32, height: u32) -> Result<(), Error> {
     let lib_gles = libc::dlopen(c"libGLESv2.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
     let lib_egl = libc::dlopen(c"libEGL.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
 
-    type EglGetProcAddressFn = unsafe extern "C" fn(*const c_char) -> *const c_void;
     let egl_get_proc: Option<EglGetProcAddressFn> = if !lib_egl.is_null() {
-        let sym = libc::dlsym(lib_egl, c"eglGetProcAddress".as_ptr());
-        if sym.is_null() {
+        let symbol = libc::dlsym(lib_egl, c"eglGetProcAddress".as_ptr());
+        if symbol.is_null() {
             None
         } else {
-            Some(std::mem::transmute(sym))
+            Some(std::mem::transmute::<*mut c_void, EglGetProcAddressFn>(symbol))
         }
     } else {
         None
     };
 
-    let gl = Arc::new(glow::Context::from_loader_function_cstr(|s| {
-        if !lib_gles.is_null() {
-            let sym = libc::dlsym(lib_gles, s.as_ptr());
-            if !sym.is_null() {
-                return sym;
-            }
-        }
-        if let Some(get_proc) = egl_get_proc {
-            let sym = get_proc(s.as_ptr());
-            if !sym.is_null() {
-                return sym;
-            }
-        }
-        libc::dlsym(libc::RTLD_DEFAULT, s.as_ptr())
+    let gl = Arc::new(glow::Context::from_loader_function_cstr(|name| unsafe {
+        load_gl_symbol(name, lib_gles, egl_get_proc)
     }));
+    let gl_api = load_gl_state_api(lib_gles, egl_get_proc);
 
-    let painter = egui_glow::Painter::new(gl.clone(), "", None)?;
+    if gl_api.get_booleanv.is_none() {
+        return Err(Error::CtxCreate);
+    }
+
+    let has_vertex_arrays = supports_vertex_arrays(&gl);
+    if !has_vertex_arrays
+        && (gl_api.get_vertex_attribiv.is_none()
+            || gl_api.get_vertex_attrib_pointerv.is_none()
+            || gl_api.vertex_attrib_pointer.is_none())
+    {
+        return Err(Error::CtxCreate);
+    }
+
+    let extensions = gl.supported_extensions();
+    let has_framebuffer_srgb = extensions
+        .iter()
+        .any(|extension| extension.ends_with("ARB_framebuffer_sRGB"));
+    let max_vertex_attribs = if has_vertex_arrays {
+        0
+    } else {
+        gl.get_parameter_i32(glow::MAX_VERTEX_ATTRIBS).max(0) as u32
+    };
+    let gl_caps = GlStateCaps {
+        has_vertex_arrays,
+        has_framebuffer_srgb,
+        max_vertex_attribs,
+    };
+
+    // Painter::new creates buffers and configures its VAO (or emulated vertex
+    // attributes on GLES2). Preserve the game's state around construction too.
+    let init_gl_state = save_gl_state(&gl, &gl_api, &gl_caps);
+    let painter_result = egui_glow::Painter::new(gl.clone(), "", None);
+    restore_gl_state(&gl, &gl_api, &init_gl_state);
+    let painter = painter_result?;
+
     let egui_ctx = egui::Context::default();
     let w = width.max(1);
     let h = height.max(1);
@@ -126,6 +555,8 @@ pub unsafe fn init_gles(width: u32, height: u32) -> Result<(), Error> {
         egui_ctx,
         painter,
         gl,
+        gl_api,
+        gl_caps,
         events: Vec::new(),
         start_time: Instant::now(),
         screen_size: (w, h),
@@ -138,125 +569,6 @@ pub unsafe fn init_gles(width: u32, height: u32) -> Result<(), Error> {
     });
 
     Ok(())
-}
-
-struct GlStateSnapshot {
-    program: i32,
-    vertex_array: Option<i32>,
-    array_buffer: i32,
-    element_array_buffer: i32,
-    active_texture: i32,
-    texture_2d: i32,
-    unpack_alignment: i32,
-    viewport: [i32; 4],
-    scissor_box: [i32; 4],
-    scissor_test: bool,
-    blend: bool,
-    cull_face: bool,
-    depth_test: bool,
-    stencil_test: bool,
-    blend_src_rgb: i32,
-    blend_dst_rgb: i32,
-    blend_src_alpha: i32,
-    blend_dst_alpha: i32,
-    blend_eq_rgb: i32,
-    blend_eq_alpha: i32,
-}
-
-unsafe fn save_gl_state(gl: &glow::Context) -> GlStateSnapshot {
-    let mut viewport = [0i32; 4];
-    let mut scissor_box = [0i32; 4];
-    gl.get_parameter_i32_slice(glow::VIEWPORT, &mut viewport);
-    gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut scissor_box);
-
-    let vertex_array = if gl.version().major >= 3 {
-        Some(gl.get_parameter_i32(glow::VERTEX_ARRAY_BINDING))
-    } else {
-        None
-    };
-
-    GlStateSnapshot {
-        program: gl.get_parameter_i32(glow::CURRENT_PROGRAM),
-        vertex_array,
-        array_buffer: gl.get_parameter_i32(glow::ARRAY_BUFFER_BINDING),
-        element_array_buffer: gl.get_parameter_i32(glow::ELEMENT_ARRAY_BUFFER_BINDING),
-        active_texture: gl.get_parameter_i32(glow::ACTIVE_TEXTURE),
-        texture_2d: gl.get_parameter_i32(glow::TEXTURE_BINDING_2D),
-        unpack_alignment: gl.get_parameter_i32(glow::UNPACK_ALIGNMENT),
-        viewport,
-        scissor_box,
-        scissor_test: gl.is_enabled(glow::SCISSOR_TEST),
-        blend: gl.is_enabled(glow::BLEND),
-        cull_face: gl.is_enabled(glow::CULL_FACE),
-        depth_test: gl.is_enabled(glow::DEPTH_TEST),
-        stencil_test: gl.is_enabled(glow::STENCIL_TEST),
-        blend_src_rgb: gl.get_parameter_i32(glow::BLEND_SRC_RGB),
-        blend_dst_rgb: gl.get_parameter_i32(glow::BLEND_DST_RGB),
-        blend_src_alpha: gl.get_parameter_i32(glow::BLEND_SRC_ALPHA),
-        blend_dst_alpha: gl.get_parameter_i32(glow::BLEND_DST_ALPHA),
-        blend_eq_rgb: gl.get_parameter_i32(glow::BLEND_EQUATION_RGB),
-        blend_eq_alpha: gl.get_parameter_i32(glow::BLEND_EQUATION_ALPHA),
-    }
-}
-
-unsafe fn restore_gl_state(gl: &glow::Context, s: &GlStateSnapshot) {
-    gl.use_program(NonZeroU32::new(s.program as u32).map(glow::NativeProgram));
-    if let Some(vao) = s.vertex_array {
-        gl.bind_vertex_array(NonZeroU32::new(vao as u32).map(glow::NativeVertexArray));
-    }
-    gl.bind_buffer(
-        glow::ARRAY_BUFFER,
-        NonZeroU32::new(s.array_buffer as u32).map(glow::NativeBuffer),
-    );
-    gl.bind_buffer(
-        glow::ELEMENT_ARRAY_BUFFER,
-        NonZeroU32::new(s.element_array_buffer as u32).map(glow::NativeBuffer),
-    );
-    gl.active_texture(s.active_texture as u32);
-    gl.bind_texture(
-        glow::TEXTURE_2D,
-        NonZeroU32::new(s.texture_2d as u32).map(glow::NativeTexture),
-    );
-    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, s.unpack_alignment.max(1));
-    gl.viewport(s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
-    gl.scissor(
-        s.scissor_box[0],
-        s.scissor_box[1],
-        s.scissor_box[2],
-        s.scissor_box[3],
-    );
-    if s.scissor_test {
-        gl.enable(glow::SCISSOR_TEST);
-    } else {
-        gl.disable(glow::SCISSOR_TEST);
-    }
-    if s.blend {
-        gl.enable(glow::BLEND);
-    } else {
-        gl.disable(glow::BLEND);
-    }
-    if s.cull_face {
-        gl.enable(glow::CULL_FACE);
-    } else {
-        gl.disable(glow::CULL_FACE);
-    }
-    if s.depth_test {
-        gl.enable(glow::DEPTH_TEST);
-    } else {
-        gl.disable(glow::DEPTH_TEST);
-    }
-    if s.stencil_test {
-        gl.enable(glow::STENCIL_TEST);
-    } else {
-        gl.disable(glow::STENCIL_TEST);
-    }
-    gl.blend_func_separate(
-        s.blend_src_rgb as u32,
-        s.blend_dst_rgb as u32,
-        s.blend_src_alpha as u32,
-        s.blend_dst_alpha as u32,
-    );
-    gl.blend_equation_separate(s.blend_eq_rgb as u32, s.blend_eq_alpha as u32);
 }
 
 pub unsafe fn paint_gles(
@@ -337,7 +649,7 @@ pub unsafe fn paint_gles(
         }
     }
 
-    let gl_snapshot = save_gl_state(&state.gl);
+    let gl_snapshot = save_gl_state(&state.gl, &state.gl_api, &state.gl_caps);
 
     for (id, image_delta) in textures_delta.set {
         state.painter.set_texture(id, &image_delta);
@@ -354,7 +666,7 @@ pub unsafe fn paint_gles(
         state.painter.free_texture(id);
     }
 
-    restore_gl_state(&state.gl, &gl_snapshot);
+    restore_gl_state(&state.gl, &state.gl_api, &gl_snapshot);
 
     Ok(())
 }
