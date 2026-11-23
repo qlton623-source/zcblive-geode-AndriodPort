@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gfmod::*;
-use kittyaudio::Sound;
 use serde::{Deserialize, Serialize};
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -131,15 +131,6 @@ impl ClickType {
     pub fn preferred(self) -> [Self; 8] {
         use ClickType::*;
 
-        // HardClick => HardClick, Click, SoftClick, MicroClick, HardRelease, Release, SoftRelease, MicroRelease
-        // HardRelease => HardRelease, Release, SoftRelease, MicroRelease, HardClick, Click, SoftClick, MicroClick
-        // Click => Click, HardClick, SoftClick, MicroClick, Release, HardRelease, SoftRelease, MicroRelease
-        // Release => Release, HardRelease, SoftRelease, MicroRelease, Click, HardClick, SoftClick, MicroClick
-        // SoftClick => SoftClick, MicroClick, Click, HardClick, SoftRelease, MicroRelease, Release, HardRelease
-        // SoftRelease => SoftRelease, MicroRelease, Release, HardRelease, SoftClick, MicroClick, Click, HardClick
-        // MicroClick => MicroClick, SoftClick, Click, HardClick, MicroRelease, SoftRelease, Release, HardRelease
-        // MicroRelease => MicroRelease, SoftRelease, Release, HardRelease, MicroClick, SoftClick, Click, HardClick
-
         match self {
             HardClick => [
                 HardClick,
@@ -247,63 +238,42 @@ impl ClickType {
 
 #[derive(Clone)]
 pub struct SoundWrapper {
-    pub sound: Sound,
-    //pub pathbuf: PathBuf,
     pub fmod_sound: *mut FMOD_SOUND,
 }
 
 impl SoundWrapper {
     pub fn from_path(system: *mut FMOD_SYSTEM, path: &Path) -> Result<Self> {
-        // load kittyaudio sound
-        let sound = Sound::from_path(path)?;
-
-        // create fmod sound exinfo, we want to load the sound from memory
-        let mut exinfo: FMOD_CREATESOUNDEXINFO = unsafe { std::mem::zeroed() };
-        exinfo.cbsize = std::mem::size_of::<FMOD_CREATESOUNDEXINFO>() as i32;
-        exinfo.numchannels = 2;
-        exinfo.format = FMOD_SOUND_FORMAT_PCMFLOAT;
-        exinfo.defaultfrequency = sound.sample_rate() as i32;
-        exinfo.length = sound.frames.len() as u32 * std::mem::size_of::<f32>() as u32 * 2;
-
-        // create fmod sound
+        if system.is_null() {
+            anyhow::bail!("FMOD system is not initialized yet");
+        }
+        let path_str = path.to_string_lossy();
+        let c_path = CString::new(path_str.as_ref())?;
         let mut fmod_sound: *mut FMOD_SOUND = std::ptr::null_mut();
         unsafe {
-            // we ignore this error because it doesn't matter if you use the kittyaudio backend
-            let _ = FMOD_System_CreateSound(
+            FMOD_System_CreateSound(
                 system,
-                sound.frames.as_ptr() as *const i8,
-                FMOD_OPENMEMORY | FMOD_OPENRAW | FMOD_LOOP_OFF,
-                &mut exinfo,
+                c_path.as_ptr(),
+                FMOD_CREATESAMPLE | FMOD_2D | FMOD_LOOP_OFF,
+                std::ptr::null_mut(),
                 &mut fmod_sound,
             )
-            .fmod_result()
-            .map_err(|e| log::error!("failed to create fmod sound: {e}"));
-        };
-
-        Ok(Self { sound, fmod_sound })
+            .fmod_result()?;
+        }
+        if fmod_sound.is_null() {
+            anyhow::bail!("FMOD_System_CreateSound returned null sound for {path:?}");
+        }
+        Ok(Self { fmod_sound })
     }
 
     fn free(&mut self) {
-        let _ = unsafe {
-            FMOD_Sound_Release(self.fmod_sound)
-                .fmod_result()
-                .map_err(|e| log::error!("failed to release fmod sound: {e}"))
-        };
-        self.fmod_sound = std::ptr::null_mut();
-    }
-}
-
-impl std::ops::Deref for SoundWrapper {
-    type Target = Sound;
-
-    fn deref(&self) -> &Self::Target {
-        &self.sound
-    }
-}
-
-impl std::ops::DerefMut for SoundWrapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.sound
+        if !self.fmod_sound.is_null() {
+            let _ = unsafe {
+                FMOD_Sound_Release(self.fmod_sound)
+                    .fmod_result()
+                    .map_err(|e| log::error!("failed to release fmod sound: {e}"))
+            };
+            self.fmod_sound = std::ptr::null_mut();
+        }
     }
 }
 
@@ -321,12 +291,14 @@ pub struct PlayerClicks {
 
 fn read_clicks_in_directory(dir: &Path, system: *mut FMOD_SYSTEM) -> Vec<SoundWrapper> {
     let Ok(dir) = dir.read_dir() else {
-        // log::warn!("can't find directory {dir:?}, skipping");
         return vec![];
     };
     let mut sounds = vec![];
     for entry in dir {
-        let path = entry.unwrap().path();
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
         if path.is_file() {
             let sound = SoundWrapper::from_path(system, &path);
             if let Ok(sound) = sound {
@@ -362,9 +334,10 @@ impl PlayerClicks {
             log::debug!("skipping matching file {:?}", path);
             return;
         }
-        let filename: String = path
-            .file_name()
-            .unwrap()
+        let Some(fname) = path.file_name() else {
+            return;
+        };
+        let filename: String = fname
             .to_string_lossy()
             .chars()
             .filter(|c| c.is_alphabetic())
@@ -527,9 +500,13 @@ fn find_noise_file(dir: &Path) -> Option<PathBuf> {
         return None;
     };
     for entry in dir {
-        let path = entry.unwrap().path();
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        // if it's a noise*, etc file we should try to load it
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if path.is_file()
             && (filename.starts_with("noise")
                 || filename.starts_with("whitenoise")
@@ -547,7 +524,6 @@ impl Clickpack {
         let Some(path) = find_noise_file(dir) else {
             return;
         };
-        // try to load noise
         self.noise = SoundWrapper::from_path(system, &path).ok();
     }
 
@@ -561,7 +537,7 @@ impl Clickpack {
         self.path = clickpack_dir.to_path_buf();
         self.name = clickpack_dir
             .file_name()
-            .unwrap()
+            .unwrap_or_default()
             .to_string_lossy()
             .to_string();
 
@@ -569,11 +545,10 @@ impl Clickpack {
             self.noise = None;
         }
 
-        // this is probably the most confusing code i've ever written
         let mut has_cleared = false;
         for (i, dir) in CLICKPACK_DIRNAMES.iter().enumerate() {
             let sound_idx = if load_for != LoadClickpackFor::All {
-                load_for.to_index() - 1 // because All is the first variant
+                load_for.to_index() - 1
             } else {
                 i
             };
@@ -595,7 +570,6 @@ impl Clickpack {
                 sounds.load_from_subdirs(clickpack_dir, system);
             }
 
-            // try to load noise from the sound directories
             if self.noise.is_none() {
                 self.load_noise(&path, system);
             }
@@ -606,7 +580,6 @@ impl Clickpack {
             self[0].load_from_subdirs(clickpack_dir, system);
         }
 
-        // try to load noise from the root clickpack dir
         if self.noise.is_none() {
             self.load_noise(clickpack_dir, system);
         }
@@ -616,33 +589,6 @@ impl Clickpack {
             "amount of sounds in clickpack {clickpack_dir:?}: {}",
             self.num_sounds
         );
-        for mode in [
-            ("player1", &self.player1),
-            ("player2", &self.player2),
-            ("left1", &self.left1),
-            ("right1", &self.right1),
-            ("left2", &self.left2),
-            ("right2", &self.right2),
-        ] {
-            log::info!("    {}: {} sounds", mode.0, mode.1.num_sounds());
-            for sounds in [
-                ("hardclicks", &mode.1.hardclicks),
-                ("hardreleases", &mode.1.hardreleases),
-                ("clicks", &mode.1.clicks),
-                ("releases", &mode.1.releases),
-                ("softclicks", &mode.1.softclicks),
-                ("softreleases", &mode.1.softreleases),
-                ("microclicks", &mode.1.microclicks),
-                ("microreleases", &mode.1.microreleases),
-            ] {
-                log::info!(
-                    "        {}: {} sounds{}",
-                    sounds.0,
-                    sounds.1.len(),
-                    if sounds.1.len() != 0 { " <<<<<<<" } else { "" }
-                );
-            }
-        }
         self.has_platformer_sounds = self.left1.num_sounds() != 0
             || self.right1.num_sounds() != 0
             || self.left2.num_sounds() != 0
@@ -679,9 +625,6 @@ impl Clickpack {
         player2: bool,
         button: Button,
     ) -> SoundWrapper {
-        // try to get a random click/release from the player clicks
-        // if it doesn't exist for the wanted player, use the other one (guaranteed to have atleast
-        // one click)
         let p1 = &self.player1;
         let p2 = &self.player2;
         let l1 = &self.left1;
@@ -698,8 +641,6 @@ impl Clickpack {
                     return click.clone();
                 }
             }
-            // this should never trigger unless we have a clickpack with 0 sounds,
-            // which is not going to lead us here
             panic!("no valid clicks found, should be unreachable!");
         }
 
@@ -762,5 +703,41 @@ impl Drop for Clickpack {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_all_eight_click_categories_from_timing() {
+        let t = Timings::default();
+        assert_eq!(ClickType::from_time(true, 2.5, &t), ClickType::HardClick);
+        assert_eq!(ClickType::from_time(false, 2.5, &t), ClickType::HardRelease);
+        assert_eq!(ClickType::from_time(true, 0.5, &t), ClickType::Click);
+        assert_eq!(ClickType::from_time(false, 0.5, &t), ClickType::Release);
+        assert_eq!(ClickType::from_time(true, 0.05, &t), ClickType::SoftClick);
+        assert_eq!(ClickType::from_time(false, 0.05, &t), ClickType::SoftRelease);
+        assert_eq!(ClickType::from_time(true, 0.01, &t), ClickType::MicroClick);
+        assert_eq!(ClickType::from_time(false, 0.01, &t), ClickType::MicroRelease);
+    }
+
+    #[test]
+    fn preferred_fallback_contains_all_eight_categories() {
+        let pref = ClickType::HardClick.preferred();
+        assert_eq!(pref[0], ClickType::HardClick);
+        assert_eq!(pref.len(), 8);
+        assert!(ClickType::SoftRelease.is_release());
+        assert!(!ClickType::SoftRelease.is_click());
+    }
+
+    #[test]
+    fn button_and_null_fmod_guard() {
+        assert_eq!(Button::from_u8(1), Button::Jump);
+        assert!(Button::from_u8(2).is_platformer());
+        assert!(Button::from_u8(3).is_platformer());
+        assert!(!Button::from_u8(1).is_platformer());
+        assert!(SoundWrapper::from_path(std::ptr::null_mut(), Path::new("click.wav")).is_err());
     }
 }

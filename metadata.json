@@ -1,0 +1,5 @@
+{
+  "name": "ZCB Live",
+  "description": "A next-generation Geometry Dash clickbot with realistic click sound synthesis, timings, pitch and volume variation, and platformer support.",
+  "requestFramePermissions": []
+}

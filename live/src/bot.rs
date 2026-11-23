@@ -1,6 +1,3 @@
-#[cfg(not(feature = "geode"))]
-use crate::{game::PlayLayer, hooks};
-
 use crate::{
     clickpack::{Button, ClickType, Clickpack, LoadClickpackFor, Pitch, Timings, VolumeSettings},
     utils,
@@ -14,24 +11,18 @@ use egui_keybind::{Bind, Keybind, Shortcut};
 use egui_modal::{Icon, Modal};
 use egui_notify::{Toast, Toasts};
 use gfmod::*;
-use kittyaudio::{Device, Mixer, PlaybackRate, SoundHandle, StreamSettings};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::{
     ops::RangeInclusive,
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
-
-#[cfg(not(feature = "geode"))]
-use windows::Win32::System::Console::{AllocConsole, FreeConsole};
 
 /// Global bot state
 pub static mut BOT: Lazy<Box<Bot>> = Lazy::new(Box::<Bot>::default);
@@ -66,15 +57,6 @@ impl Default for Shortcuts {
     }
 }
 
-fn skip_serializing_selected_device(device: &str) -> bool {
-    let is_default = if let Ok(name) = Device::Default.name() {
-        name == device
-    } else {
-        false
-    };
-    device.is_empty() || is_default
-}
-
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub enum ClickpackEnv {
     #[default]
@@ -88,11 +70,6 @@ pub struct Env {
     version: String,
     clickpack_ord: Vec<(ClickpackEnv, LoadClickpackFor)>,
     is_first_launch: bool,
-    #[serde(
-        default = "String::new",
-        skip_serializing_if = "skip_serializing_selected_device"
-    )]
-    pub selected_device: String,
 }
 
 impl Default for Env {
@@ -101,18 +78,18 @@ impl Default for Env {
             version: built_info::PKG_VERSION.to_string(),
             clickpack_ord: vec![(ClickpackEnv::None, LoadClickpackFor::All)],
             is_first_launch: true, // overriden later
-            selected_device: String::new(),
         }
     }
 }
 
 impl Env {
     pub fn load() -> Self {
-        let _ = std::fs::create_dir_all(".zcb")
+        let zcb_dir = utils::zcb_dir();
+        let _ = std::fs::create_dir_all(zcb_dir)
             .map_err(|e| log::error!("failed to create .zcb directory: {e}"));
 
-        let path = Path::new(".zcb/env.json");
-        if let Ok(f) = std::fs::File::open(path) {
+        let path = utils::zcb_path("env.json");
+        if let Ok(f) = std::fs::File::open(&path) {
             let env = serde_json::from_reader(f);
             if let Ok(env) = env {
                 return env;
@@ -123,7 +100,7 @@ impl Env {
 
         // if we're here we failed
         log::warn!("failed to deserialize env, writing defaults");
-        if let Ok(f) = std::fs::File::create(path) {
+        if let Ok(f) = std::fs::File::create(&path) {
             let _ = serde_json::to_writer_pretty(f, &Self::default())
                 .map_err(|e| log::error!("failed to write env: {e}"));
         }
@@ -132,10 +109,11 @@ impl Env {
     }
 
     pub fn save(&self) {
-        log::info!("writing .zcb/env.json");
+        let path = utils::zcb_path("env.json");
+        log::info!("writing {path:?}");
         let mut env = self.clone();
         env.version = built_info::PKG_VERSION.to_string();
-        if let Ok(f) = std::fs::File::create(".zcb/env.json") {
+        if let Ok(f) = std::fs::File::create(&path) {
             let _ = serde_json::to_writer_pretty(f, &env)
                 .map_err(|e| log::error!("failed to write env: {e}"));
         }
@@ -162,10 +140,6 @@ impl Env {
 
 const fn true_value() -> bool {
     true
-}
-
-const fn default_buffer_size() -> u32 {
-    512
 }
 
 #[inline]
@@ -262,8 +236,6 @@ pub struct Config {
     pub enabled: bool,
     #[serde(default = "bool::default")]
     pub hidden: bool,
-    #[serde(default = "default_buffer_size")]
-    pub buffer_size: u32,
     #[serde(default = "bool::default")]
     pub play_noise: bool,
     #[serde(default = "float_one")]
@@ -272,20 +244,14 @@ pub struct Config {
     pub force_playing_platformer: bool,
     #[serde(default = "bool::default")]
     pub use_alternate_hook: bool,
-    #[serde(default = "bool::default")]
-    pub show_console: bool,
     #[serde(default = "Stage::default")]
     pub stage: Stage,
-    #[serde(default = "bool::default")]
-    pub use_fmod: bool,
     #[serde(default = "bool::default")]
     pub cut_sounds: bool,
     #[serde(default = "bool::default")]
     pub cut_by_releases: bool,
     #[serde(default = "float_one")]
     pub click_speedhack: f64,
-    // #[serde(default = "true_value")]
-    // pub sync_speed_with_game: bool,
     #[serde(default = "float_one")]
     pub noise_speedhack: f64,
     #[serde(default = "LoadClickpackFor::default")]
@@ -317,11 +283,6 @@ pub struct Config {
 impl Config {
     #[inline]
     pub fn fixup(mut self) -> Self {
-        self.buffer_size = self.buffer_size.max(1);
-        #[cfg(feature = "geode")]
-        {
-            self.show_console = false;
-        }
         self.ui_scale = self
             .ui_scale
             .clamp(*UI_SCALE_RANGE.start(), *UI_SCALE_RANGE.end());
@@ -339,14 +300,11 @@ impl Default for Config {
             shortcuts: Shortcuts::default(),
             enabled: true,
             hidden: false,
-            buffer_size: default_buffer_size(),
             play_noise: false,
             noise_volume: 1.0,
             force_playing_platformer: false,
             use_alternate_hook: false,
-            show_console: false,
             stage: Stage::default(),
-            use_fmod: false,
             cut_sounds: false,
             cut_by_releases: false,
             click_speedhack: 1.0,
@@ -369,7 +327,7 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let mut path = PathBuf::from(".zcb/");
+        let mut path = utils::zcb_dir().clone();
         log::debug!("creating directory {path:?}");
         std::fs::create_dir_all(&path)?;
         path.push("config.json");
@@ -395,13 +353,14 @@ impl Config {
     }
 
     pub fn save(&self) {
-        let Ok(f) = std::fs::File::create(".zcb/config.json") else {
-            log::error!("failed to create config.json!");
+        let path = utils::zcb_path("config.json");
+        let Ok(f) = std::fs::File::create(&path) else {
+            log::error!("failed to create {path:?}!");
             return;
         };
         let _ = serde_json::to_writer_pretty(f, self)
             .map_err(|e| log::error!("failed to write config: {e}"))
-            .map(|_| log::debug!("successfully saved config to \".zcb/config.json\""));
+            .map(|_| log::debug!("successfully saved config to {path:?}"));
     }
 }
 
@@ -457,25 +416,19 @@ pub struct Bot {
     pub conf: Config,
     pub prev_conf: Config,
     pub last_conf_save: Instant,
-    pub mixer: Mixer,
-    #[cfg(not(feature = "geode"))]
-    pub playlayer: PlayLayer,
     pub prev_times: ClickTimes,
     pub is_loading_clickpack: Arc<AtomicBool>,
     pub prev_pitch: f64,
     pub prev_volume: f64,
     pub prev_spam_offset: f64,
-    pub buffer_size_changed: bool,
-    pub noise_sound: Option<SoundHandle>,
     pub clickpacks: Vec<String>,
     pub last_clickpack_reload: Instant,
     pub system: FmodSystem,
-    pub channel: *mut FMOD_CHANNEL,
+    pub click_channel_group: *mut FMOD_CHANNELGROUP,
+    pub active_fmod_channels: Vec<*mut FMOD_CHANNEL>,
     pub env: Env,
     pub toasts: Arc<Mutex<Toasts>>,
     pub fmod_noise_sound: *mut FMOD_CHANNEL,
-    pub show_fmod_buffersize_warn: bool,
-    pub startup_buffer_size: u32,
     pub is_in_level: bool,
     pub playlayer_time: f64,
     pub clickpack: Clickpack,
@@ -484,39 +437,35 @@ pub struct Bot {
     pub clickpack_db: ClickpackDb,
     pub clickpack_db_open: bool,
     pub prev_scale_factor: f32,
+    #[allow(dead_code)]
     pub dead_timer: f32,
+    #[allow(dead_code)]
     pub dead_timer_limit: f32,
-    pub devices: Arc<Mutex<Vec<String>>>,
+    pub pending_preload: bool,
+    pub open_folder_cb: Option<extern "C" fn(*const std::ffi::c_char)>,
 }
 
 impl Default for Bot {
     fn default() -> Self {
         let conf = Config::load().unwrap_or_default().fixup();
-        let startup_buffer_size = conf.buffer_size;
         let now = Instant::now();
         Self {
             conf: conf.clone(),
             prev_conf: conf,
             last_conf_save: now,
-            mixer: Mixer::new(),
-            #[cfg(not(feature = "geode"))]
-            playlayer: PlayLayer::NULL,
             prev_times: ClickTimes::default(),
             is_loading_clickpack: Arc::new(AtomicBool::new(false)),
             prev_pitch: f64::NAN,
             prev_volume: f64::NAN,
             prev_spam_offset: f64::NAN,
-            buffer_size_changed: false,
-            noise_sound: None,
             clickpacks: vec![],
             last_clickpack_reload: now,
             system: FmodSystem::new(std::ptr::null_mut()),
-            channel: std::ptr::null_mut(),
+            click_channel_group: std::ptr::null_mut(),
+            active_fmod_channels: vec![],
             env: Env::load(),
             toasts: Arc::new(Mutex::new(Toasts::new())),
             fmod_noise_sound: std::ptr::null_mut(),
-            show_fmod_buffersize_warn: false,
-            startup_buffer_size,
             is_in_level: false,
             playlayer_time: 0.0,
             clickpack: Clickpack::default(),
@@ -527,7 +476,8 @@ impl Default for Bot {
             prev_scale_factor: 1.0,
             dead_timer: f32::NAN,
             dead_timer_limit: 0.0,
-            devices: Arc::new(Mutex::new(vec![])),
+            pending_preload: false,
+            open_folder_cb: None,
         }
     }
 }
@@ -542,30 +492,6 @@ fn help_text<R>(ui: &mut egui::Ui, help: &str, add_contents: impl FnOnce(&mut eg
         ui.add_enabled_ui(false, |ui| ui.label("(?)").on_disabled_hover_text(help));
     });
 }
-
-/// Value is always min clamped with 1.
-fn u32_edit_field_min1(ui: &mut egui::Ui, value: &mut u32) -> egui::Response {
-    let mut tmp_value = format!("{value}");
-    let res = ui.text_edit_singleline(&mut tmp_value);
-    if let Ok(result) = tmp_value.parse::<u32>() {
-        *value = result.max(1);
-    }
-    res
-}
-
-/*
-#[inline]
-fn gd_audio_pitch() -> f32 {
-    let mut pitch = 1.0f32;
-    unsafe {
-        let _ = FMOD_Channel_GetPitch(
-            FMODAudioEngine::shared().current_sound_channel(),
-            &mut pitch,
-        );
-    };
-    pitch
-}
-*/
 
 fn show_error_dialog(modal: Arc<Mutex<Modal>>, title: &str, body: &str) {
     log::error!("{title}: {body}");
@@ -630,139 +556,71 @@ fn ureq_get(url: &str) -> Result<Vec<u8>, String> {
 }
 
 impl Bot {
-    fn maybe_init_kittyaudio(&mut self) {
-        if self.conf.use_fmod {
+    /// Attach to Geometry Dash's already-initialized FMOD::System without creating a second system.
+    pub unsafe fn on_fmod_ready(&mut self, system: *mut FMOD_SYSTEM) {
+        if system.is_null() {
             return;
         }
-        log::debug!("starting kittyaudio playback thread");
-        self.mixer = Mixer::new();
-        let device = self.get_device();
-
-        self.mixer.init_ex(
-            device,
-            StreamSettings {
-                buffer_size: Some(self.conf.buffer_size),
-                ..Default::default()
-            },
-        );
-    }
-
-    pub unsafe fn init_fmod(&mut self) -> Result<()> {
-        const SYSTEM_SAMPLERATE: i32 = 48_000;
-        log::info!("initializing fmod system");
-        if !self.system.is_null() {
-            self.release_fmod();
+        if *self.system == system && !self.click_channel_group.is_null() {
+            return;
         }
 
-        log::debug!("fmod FMOD_System_Create");
-        FMOD_System_Create(&mut self.system.ptr, FMOD_VERSION).fmod_result()?;
-        //let extra_driver_data = (self.fmod_fns.extra_driver_data)();
-
-        log::debug!(
-            "fmod FMOD_System_SetSoftwareFormat, system: {:p}",
-            self.system.as_ptr()
-        );
-        FMOD_System_SetSoftwareFormat(*self.system, SYSTEM_SAMPLERATE, FMOD_SPEAKERMODE_STEREO, 0)
-            .fmod_result()?;
-
-        // set buffer size
-        /*
-        FMOD_System_SetStreamBufferSize(*self.system, self.conf.buffer_size, FMOD_TIMEUNIT_PCM)
-            .fmod_result()?;
-
-        let mut numbuffers = 0i32;
-        let mut bufferlength = 0u32;
-        FMOD_System_GetDSPBufferSize(*self.system, &mut bufferlength, &mut numbuffers)
-            .fmod_result()?;
-        log::info!(
-            "FMOD_System_GetDSPBufferSize: bufferlength: {bufferlength}, numbuffers: {numbuffers}"
-        );
-        FMOD_System_SetDSPBufferSize(*self.system, self.conf.buffer_size, numbuffers)
-            .fmod_result()?;
-            */
-
-        // init system
-        self.fmod_apply_buffer_size()?;
-        log::debug!("fmod FMOD_System_Init");
-        FMOD_System_Init(*self.system, 2048, FMOD_INIT_NORMAL, std::ptr::null_mut())
-            .fmod_result()?;
-
-        log::info!("successfully initialized fmod system, samplerate: {SYSTEM_SAMPLERATE}");
-        Ok(())
-    }
-
-    fn fmod_apply_buffer_size(&self) -> Result<()> {
-        unsafe {
-            FMOD_System_SetStreamBufferSize(*self.system, self.conf.buffer_size, FMOD_TIMEUNIT_PCM)
-                .fmod_result()?;
-
-            let mut numbuffers = 0i32;
-            let mut bufferlength = 0u32;
-            FMOD_System_GetDSPBufferSize(*self.system, &mut bufferlength, &mut numbuffers)
-                .fmod_result()?;
-            log::info!(
-                "FMOD_System_GetDSPBufferSize: bufferlength: {bufferlength}, numbuffers: {numbuffers}"
-            );
-            FMOD_System_SetDSPBufferSize(*self.system, self.conf.buffer_size, numbuffers)
-                .fmod_result()?;
+        if !self.click_channel_group.is_null() {
+            let _ = FMOD_ChannelGroup_Stop(self.click_channel_group);
+            let _ = FMOD_ChannelGroup_Release(self.click_channel_group);
+            self.click_channel_group = std::ptr::null_mut();
         }
-        Ok(())
+
+        self.system = FmodSystem::new(system);
+        log::info!("attached to Geometry Dash FMOD system {:p}", system);
+
+        let name = std::ffi::CString::new("zcblive_clicks").unwrap();
+        let mut group: *mut FMOD_CHANNELGROUP = std::ptr::null_mut();
+        let res = FMOD_System_CreateChannelGroup(system, name.as_ptr(), &mut group);
+        if res == FMOD_OK && !group.is_null() {
+            self.click_channel_group = group;
+        } else {
+            log::warn!("FMOD_System_CreateChannelGroup failed ({res:?}); using per-channel stop fallback");
+        }
+
+        if self.pending_preload {
+            self.pending_preload = false;
+            self.preload_clickpack();
+        }
     }
 
     pub fn release_fmod(&mut self) {
-        let _ = unsafe {
-            FMOD_System_Release(*self.system)
-                .fmod_result()
-                .map_err(|e| log::error!("failed to release fmod system: {e}"))
-        };
+        if !self.fmod_noise_sound.is_null() {
+            unsafe {
+                let _ = FMOD_Channel_Stop(self.fmod_noise_sound);
+            }
+            self.fmod_noise_sound = std::ptr::null_mut();
+        }
+        if !self.click_channel_group.is_null() {
+            unsafe {
+                let _ = FMOD_ChannelGroup_Stop(self.click_channel_group);
+                let _ = FMOD_ChannelGroup_Release(self.click_channel_group);
+            }
+            self.click_channel_group = std::ptr::null_mut();
+        }
+        self.active_fmod_channels.clear();
+        // Geometry Dash owns self.system; never call FMOD_System_Release on it.
         *self.system = std::ptr::null_mut();
     }
 
     pub fn init(&mut self) {
-        {
-            let devices_arc = self.devices.clone();
-            std::thread::spawn(move || {
-                let mut prev_devices = vec![];
-                loop {
-                    if unsafe { BOT.conf.use_fmod } {
-                        continue;
-                    }
-                    if let Ok(devices) = kittyaudio::device_names() {
-                        // only lock when device lists do not match
-                        if devices != prev_devices {
-                            log::trace!("updated device list: {devices:?}");
-                            *devices_arc.lock() = devices.clone();
-                            prev_devices = devices;
-                        }
-                    }
-                    std::thread::sleep(Duration::from_secs(4));
-                }
-            });
-        }
-
-        // init audio playback
-        if !self.conf.use_fmod {
-            self.maybe_init_kittyaudio();
-        }
-        unsafe {
-            let _ = self
-                .init_fmod()
-                .map_err(|e| log::error!("failed to init fmod: {e}"));
-        };
-
-        // reload clickpacks
+        // Reload local clickpack list from .zcb/clickpacks
         let _ = self
             .reload_clickpacks()
             .map_err(|e| log::error!("failed to reload clickpacks: {e}"));
 
-        // preload clickpack
-        self.preload_clickpack();
-
-        // init game hooks
-        #[cfg(not(feature = "geode"))]
-        {
-            log::debug!("initializing hooks");
-            unsafe { hooks::init_hooks().unwrap() };
+        // Preload configured clickpack once GD's FMOD system is ready
+        if !self.system.is_null() {
+            self.pending_preload = false;
+            self.preload_clickpack();
+        } else {
+            log::info!("deferring clickpack preload until GD FMOD::System initializes");
+            self.pending_preload = true;
         }
     }
 
@@ -809,7 +667,7 @@ impl Bot {
                     for dirname in &self.clickpacks {
                         if dirname == name {
                             prev_join_handle = Some(preload_clickpack(
-                                PathBuf::from(".zcb").join("clickpacks").join(dirname),
+                                utils::zcb_path("clickpacks").join(dirname),
                                 self.toasts.clone(),
                                 prev_join_handle,
                                 *load_for,
@@ -852,12 +710,7 @@ impl Bot {
         }
     }
 
-    #[allow(unused_variables)]
-    pub fn on_init(&mut self, playlayer: usize) {
-        #[cfg(not(feature = "geode"))]
-        {
-            self.playlayer.addr = playlayer;
-        }
+    pub fn on_init(&mut self, _playlayer: usize) {
 
         self.prev_times = ClickTimes::default();
         self.prev_pitch = 0.0;
@@ -930,19 +783,8 @@ impl Bot {
         */
     }
 
-    #[allow(unused_mut)]
-    pub unsafe fn on_action(&mut self, button: Button, mut player2: bool, push: bool) {
+    pub unsafe fn on_action(&mut self, button: Button, player2: bool, push: bool) {
         if self.clickpack.num_sounds == 0 || !self.is_in_level || !self.conf.enabled {
-            return;
-        }
-        #[cfg(not(feature = "geode"))]
-        if player2 && !self.playlayer.is_null()
-        /* FIXME(2.206): && !self.playlayer.level_settings().is_2player() */
-        {
-            player2 = self.conf.force_player2_sounds;
-        }
-        #[cfg(not(feature = "geode"))]
-        if !self.playlayer.is_null() {
             return;
         }
         if button.is_platformer()
@@ -967,20 +809,12 @@ impl Bot {
         if self.conf.ignored_click_types.is_ignored(click_type) {
             return;
         }
-        let use_fmod = self.conf.use_fmod;
 
         // get click
-        let mut click = self
+        let click = self
             .clickpack
-            .get_random_click(click_type, player2, button)
-            .clone();
+            .get_random_click(click_type, player2, button);
         let pitch = self.get_pitch() * self.conf.click_speedhack;
-        // if self.conf.sync_speed_with_game {
-        //     pitch *= gd_audio_pitch() as f64;
-        // }
-        if !use_fmod {
-            click.set_playback_rate(PlaybackRate::Factor(pitch));
-        }
 
         // compute & change volume
         {
@@ -1005,49 +839,46 @@ impl Bot {
 
             // multiply by global volume after all of the changes
             volume *= vol.global_volume;
-
-            if !use_fmod {
-                // blehh
-                click.set_volume(volume as f32);
-            }
-            self.prev_volume = volume;
+            self.prev_volume = volume.max(0.0);
         }
 
-        // stop all playing sounds (acb behaviour)
-        if !use_fmod
-            && self.conf.cut_sounds
-            && (!click_type.is_release() || self.conf.cut_by_releases)
-        {
-            for sound in &self.mixer.renderer.guard().sounds {
-                // check if this is the noise sound, we don't want to stop it
-                let sound_len = sound.guard().frames.len();
-                if let Some(noise_sound) = &self.noise_sound {
-                    if noise_sound.guard().frames.len() == sound_len {
-                        continue;
+        // stop all playing click sounds (cut_sounds behavior)
+        if self.conf.cut_sounds && (!click_type.is_release() || self.conf.cut_by_releases) {
+            if !self.click_channel_group.is_null() {
+                let _ = FMOD_ChannelGroup_Stop(self.click_channel_group);
+            } else {
+                for ch in self.active_fmod_channels.drain(..) {
+                    if !ch.is_null() && ch != self.fmod_noise_sound {
+                        let _ = FMOD_Channel_Stop(ch);
                     }
                 }
+            }
+        }
 
-                // kis!!
-                sound.seek_to_end();
+        if !self.system.is_null() && !click.fmod_sound.is_null() {
+            let mut channel: *mut FMOD_CHANNEL = std::ptr::null_mut();
+            if FMOD_System_PlaySound(
+                *self.system,
+                click.fmod_sound,
+                self.click_channel_group,
+                1,
+                &mut channel,
+            ) == FMOD_OK
+                && !channel.is_null()
+            {
+                let _ = FMOD_Channel_SetPitch(channel, pitch as f32);
+                let _ = FMOD_Channel_SetVolume(channel, self.prev_volume as f32);
+                let _ = FMOD_Channel_SetPaused(channel, 0);
+                let _ = FMOD_System_Update(*self.system);
+                if self.click_channel_group.is_null() && self.conf.cut_sounds {
+                    if self.active_fmod_channels.len() > 32 {
+                        self.active_fmod_channels.remove(0);
+                    }
+                    self.active_fmod_channels.push(channel);
+                }
             }
         }
-        // FIXME: temporary 2.2 fix
-        if !use_fmod {
-            self.mixer.play(click.sound);
-        } else {
-            unsafe {
-                FMOD_System_PlaySound(
-                    *self.system,
-                    click.fmod_sound,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut self.channel,
-                );
-                FMOD_Channel_SetPitch(self.channel, pitch as f32);
-                FMOD_Channel_SetVolume(self.channel, self.prev_volume as _);
-                FMOD_System_Update(*self.system);
-            }
-        }
+
         self.prev_times.set_time(
             button,
             player2,
@@ -1062,15 +893,8 @@ impl Bot {
 
     #[inline]
     fn time(&self) -> f64 {
-        #[cfg(feature = "geode")]
         if self.playlayer_time != 0.0 && self.conf.use_ingame_time {
             self.playlayer_time
-        } else {
-            self.level_start.elapsed().as_secs_f64()
-        }
-        #[cfg(not(feature = "geode"))]
-        if !self.playlayer.is_null() && self.conf.use_ingame_time {
-            self.playlayer.time()
         } else {
             self.level_start.elapsed().as_secs_f64()
         }
@@ -1085,8 +909,8 @@ impl Bot {
     }
 
     fn reload_clickpacks(&mut self) -> Result<()> {
-        let path = Path::new(".zcb/clickpacks");
-        std::fs::create_dir_all(path)?;
+        let path = utils::zcb_path("clickpacks");
+        std::fs::create_dir_all(&path)?;
         let dir = path.read_dir()?;
         let prev_clickpacks = std::mem::take(&mut self.clickpacks);
         for entry in dir {
@@ -1101,7 +925,7 @@ impl Bot {
         for prev in &prev_clickpacks {
             if !self.clickpacks.contains(prev) {
                 self.clickpack_db
-                    .mark_downloaded(prev, path.to_path_buf(), false);
+                    .mark_downloaded(prev, path.clone(), false);
             }
         }
         Ok(())
@@ -1155,10 +979,10 @@ impl Bot {
                 modal.body_and_icon(
                     ui,
                     "This seems to be your first time using ZCB Live.\n\
-                    • Press 1 to open the menu\n\
-                    • Press 2 to toggle the clickbot\n\
-                    • Explore ClickpackDB to download new clickpacks\n\
-                    You can change the hotkeys in the Options section",
+                    • Tap the floating \"ZCB\" button (or press 1 on a keyboard) to open the menu\n\
+                    • Drag the handle next to \"ZCB\" to move the button anywhere on screen\n\
+                    • Explore ClickpackDB to download clickpacks\n\
+                    • Adjust UI Scale and shortcuts in the Options section",
                     Icon::Info,
                 );
                 modal.buttons(ui, |ui| {
@@ -1190,6 +1014,24 @@ impl Bot {
 
         // don't draw and don't reload clickpacks if not open
         if self.conf.hidden {
+            if !self.env.is_first_launch {
+                egui::Area::new(egui::Id::new("zcb_android_menu_toggle"))
+                    .movable(true)
+                    .constrain(true)
+                    .default_pos(egui::pos2(16.0, 16.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::window(&ctx.style())
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("⋮⋮").weak());
+                                    if ui.button(RichText::new("ZCB").strong()).clicked() {
+                                        self.conf.hidden = false;
+                                    }
+                                });
+                            });
+                    });
+            }
             if matches!(self.conf.toast_visibility, ToastVisibility::AlwaysVisible) {
                 self.toasts.lock().show(ctx); // but still draw toast queue
             }
@@ -1220,36 +1062,51 @@ impl Bot {
             s.visuals.window_shadow = shadow;
         });
 
-        egui::Window::new("ZCB Live").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.conf.stage, Stage::Clickpack, "Clickpack");
-                ui.selectable_value(&mut self.conf.stage, Stage::Audio, "Audio");
-                ui.selectable_value(&mut self.conf.stage, Stage::Options, "Options");
-                // ui.selectable_value(&mut self.conf.stage, Stage::Cheats, "Cheats");
-            });
-            ui.separator();
+        let screen_size = ctx.screen_rect().size();
+        let max_win_size = vec2(
+            (screen_size.x - 24.0).max(200.0),
+            (screen_size.y - 24.0).max(200.0),
+        );
+        let default_win_size = vec2(
+            (screen_size.x * 0.72).clamp(240.0, 460.0),
+            (screen_size.y * 0.78).clamp(220.0, 480.0),
+        );
 
-            egui::ScrollArea::both().show(ui, |ui| {
-                match self.conf.stage {
-                    Stage::Clickpack => self.show_clickpack_window(ui, modal.clone()),
-                    Stage::Audio => {
-                        if ui
-                            .checkbox(&mut self.conf.enabled, "Enable clickbot")
-                            .changed()
-                        {
-                            self.open_clickbot_toggle_toast();
-                            self.play_noise();
-                        }
-
-                        // ui.separator();
-                        ui.add_enabled_ui(self.conf.enabled, |ui| {
-                            self.show_audio_window(ui);
-                        });
+        egui::Window::new("ZCB Live")
+            .constrain(true)
+            .default_size(default_win_size)
+            .max_size(max_win_size)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.conf.stage, Stage::Clickpack, "Clickpack");
+                    ui.selectable_value(&mut self.conf.stage, Stage::Audio, "Audio");
+                    ui.selectable_value(&mut self.conf.stage, Stage::Options, "Options");
+                    if ui.button("Hide").clicked() {
+                        self.conf.hidden = true;
                     }
-                    Stage::Options => self.show_options_window(ui, ctx, modal.clone()),
-                };
+                });
+                ui.separator();
+
+                egui::ScrollArea::both().show(ui, |ui| {
+                    match self.conf.stage {
+                        Stage::Clickpack => self.show_clickpack_window(ui, modal.clone()),
+                        Stage::Audio => {
+                            if ui
+                                .checkbox(&mut self.conf.enabled, "Enable clickbot")
+                                .changed()
+                            {
+                                self.open_clickbot_toggle_toast();
+                                self.play_noise();
+                            }
+
+                            ui.add_enabled_ui(self.conf.enabled, |ui| {
+                                self.show_audio_window(ui);
+                            });
+                        }
+                        Stage::Options => self.show_options_window(ui, ctx, modal.clone()),
+                    };
+                });
             });
-        });
 
         // show clickpackdb, if open
         self.show_clickpackdb_window(ctx, modal.clone());
@@ -1261,23 +1118,6 @@ impl Bot {
             ToastVisibility::AlwaysVisible | ToastVisibility::VisibleWhenOpen
         ) {
             self.toasts.lock().show(ctx);
-        }
-    }
-
-    #[cfg(not(feature = "geode"))]
-    pub fn maybe_alloc_console(&self) {
-        if self.conf.show_console && unsafe { AllocConsole() }.is_ok() {
-            use std::sync::Once;
-            static INIT_ONCE: Once = Once::new();
-            INIT_ONCE.call_once(|| {
-                simple_logger::SimpleLogger::new()
-                    .init()
-                    .expect("failed to initialize simple_logger");
-            });
-        } else {
-            unsafe {
-                let _ = FreeConsole();
-            }
         }
     }
 
@@ -1352,19 +1192,6 @@ impl Bot {
                     |ui| ui.checkbox(&mut self.conf.use_alternate_hook, "Use alternate hook"),
                 );
             });
-            #[cfg(not(feature = "geode"))]
-            help_text(ui, "Show debug console", |ui| {
-                if ui
-                    .checkbox(&mut self.conf.show_console, "Show console")
-                    .changed()
-                {
-                    if self.conf.show_console {
-                        self.maybe_alloc_console();
-                    } else {
-                        let _ = unsafe { FreeConsole() };
-                    }
-                }
-            });
             help_text(
                 ui,
                 "Automatically save configuration changes every 5 seconds.\n\
@@ -1412,7 +1239,7 @@ impl Bot {
                 {
                     let conf = Config::load();
                     if let Ok(conf) = conf {
-                        self.conf = conf;
+                        self.conf = conf.fixup();
                         self.apply_config();
                         self.toasts
                             .lock()
@@ -1428,7 +1255,7 @@ impl Bot {
                     .clicked()
                 {
                     let prev_stage = self.conf.stage;
-                    self.conf = Config::default();
+                    self.conf = Config::default().fixup();
                     self.conf.stage = prev_stage; // don't switch current tab
                     self.apply_config();
                     self.toasts
@@ -1440,136 +1267,73 @@ impl Bot {
                     .on_hover_text("Open .zcb folder")
                     .clicked()
                 {
-                    let _ = std::fs::create_dir_all(".zcb")
+                    let dir = utils::zcb_dir();
+                    let _ = std::fs::create_dir_all(dir)
                         .map_err(|e| log::error!("failed to create .zcb: {e}"));
-                    let _ = Command::new("explorer").arg(".zcb").spawn().map_err(|e| {
-                        show_error_dialog(modal, "Failed to open folder!", &e.to_string());
-                    });
+                    Self::open_folder_in_geode(self.open_folder_cb, dir, modal);
                 }
             });
         });
         ui.hyperlink_to("Join the Discord server!", "https://discord.gg/BRVVVzxESu");
-        ui.allocate_space(ui.available_size() - vec2(0.0, 280.0));
+        ui.allocate_space(vec2(100.0, 20.0));
     }
 
-    fn get_device(&mut self) -> Device {
-        Device::from_name(&self.env.selected_device).unwrap_or_default()
-    }
-
-    fn show_device_switcher(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_label("Output device")
-                .selected_text(&self.env.selected_device)
-                .show_ui(ui, |ui| {
-                    let devices = self.devices.lock().clone();
-                    for device in &devices {
-                        let is_selected = &self.env.selected_device == device;
-                        if ui
-                            .selectable_value(&mut self.env.selected_device, device.clone(), device)
-                            .clicked()
-                            && !is_selected
-                        {
-                            // start a new mixer on new device
-                            log::info!("switching audio device to \"{device}\"");
-                            self.maybe_init_kittyaudio();
-                            self.play_noise();
-                            self.env.save();
-                            self.toasts
-                                .lock()
-                                .add(Toast::success(format!("Switched device to \"{device}\"")));
-                            //kind: ToastKind::Success,
-                            //text: format!("Switched device to \"{device}\"").into(),
-                            //options: ToastOptions::default().duration_in_seconds(3.0),);
-                        }
-                    }
-                })
-                .response
-                .on_disabled_hover_text("Not available with FMOD");
-            if ui
-                .button("Reset")
-                .on_hover_text("Reset to the default audio device")
-                .clicked()
-            {
-                self.mixer = Mixer::new();
-                self.mixer.init();
-                if let Ok(name) = Device::Default.name() {
-                    self.env.selected_device = name.clone();
-                    self.toasts
-                        .lock()
-                        .add(Toast::success(format!("Switched device to \"{name}\"")));
-                }
-                self.play_noise();
-                self.env.save();
-                log::debug!("reset audio device");
+    fn open_folder_in_geode(
+        open_folder_cb: Option<extern "C" fn(*const std::ffi::c_char)>,
+        dir: &Path,
+        modal: Arc<Mutex<Modal>>,
+    ) {
+        if let Some(cb) = open_folder_cb {
+            if let Ok(cstr) = std::ffi::CString::new(dir.to_string_lossy().as_ref()) {
+                cb(cstr.as_ptr());
+                return;
             }
-        });
+        }
+        show_error_dialog(
+            modal,
+            "Failed to open folder!",
+            &format!("Clickpacks directory: {}", dir.display()),
+        );
     }
 
     fn play_noise(&mut self) {
-        let stop_kittyaudio_noise = |noise_sound: &mut Option<SoundHandle>| {
-            if let Some(noise_sound) = noise_sound {
-                noise_sound.set_playback_rate(PlaybackRate::Factor(1.0));
-                noise_sound.set_loop_enabled(false);
-                noise_sound.seek_to_end();
+        if !self.fmod_noise_sound.is_null() {
+            unsafe {
+                let _ = FMOD_Channel_Stop(self.fmod_noise_sound);
             }
-            *noise_sound = None;
-        };
-        let stop_fmod_noise = |fmodn: &mut *mut FMOD_CHANNEL| {
-            unsafe { FMOD_Channel_Stop(*fmodn) };
-            *fmodn = std::ptr::null_mut();
-        };
-        let mut start_kittyaudio_noise = |noise_sound: &mut Option<SoundHandle>| {
-            if let Some(mut noise) = self.clickpack.noise.clone() {
-                noise.set_volume(self.conf.noise_volume as f32);
-                noise.set_loop_enabled(true);
-                let frames = noise.frames.len().saturating_sub(1);
-                noise.set_loop_index(0..=frames);
-                noise.set_playback_rate(PlaybackRate::Factor(self.conf.noise_speedhack));
-                *noise_sound = Some(self.mixer.play(noise.sound));
-            }
-        };
-        let start_fmod_noise = |fmodn: &mut *mut FMOD_CHANNEL| unsafe {
-            if let Some(noise) = self.clickpack.noise.clone() {
-                // get sound length
-                // let mut length = 0u32;
-                // FMOD_Sound_GetLength(noise.fmod_sound, &mut length, FMOD_TIMEUNIT_PCM);
-
-                // set loop points for sound
-                FMOD_Sound_SetLoopCount(noise.fmod_sound, i32::MAX);
-                // FMOD_Sound_SetLoopPoints(
-                //     noise.fmod_sound,
-                //     0,
-                //     FMOD_TIMEUNIT_PCM,
-                //     length,
-                //     FMOD_TIMEUNIT_PCM,
-                // );
-
-                // play the sound
-                FMOD_System_PlaySound(
-                    *self.system,
-                    noise.fmod_sound,
-                    std::ptr::null_mut(),
-                    0,
-                    fmodn,
-                );
-
-                // update channel
-                FMOD_Channel_SetVolume(*fmodn, self.conf.noise_volume as _);
-                // FMOD_Channel_SetLoopPoints(*fmodn, 0, FMOD_TIMEUNIT_PCM, 1024, FMOD_TIMEUNIT_PCM);
-                FMOD_Channel_SetLoopCount(*fmodn, i32::MAX);
-                FMOD_Channel_SetPitch(*fmodn, self.conf.noise_speedhack as f32);
-                FMOD_System_Update(*self.system);
-            }
-        };
-
-        stop_kittyaudio_noise(&mut self.noise_sound);
-        stop_fmod_noise(&mut self.fmod_noise_sound);
+            self.fmod_noise_sound = std::ptr::null_mut();
+        }
 
         if self.conf.play_noise && (self.conf.enabled || self.conf.play_noise_when_disabled) {
-            if self.conf.use_fmod {
-                start_fmod_noise(&mut self.fmod_noise_sound);
-            } else {
-                start_kittyaudio_noise(&mut self.noise_sound);
+            if self.system.is_null() {
+                return;
+            }
+            if let Some(noise) = self.clickpack.noise.clone() {
+                if noise.fmod_sound.is_null() {
+                    return;
+                }
+                unsafe {
+                    let _ = FMOD_Sound_SetMode(noise.fmod_sound, FMOD_LOOP_NORMAL);
+                    let _ = FMOD_Sound_SetLoopCount(noise.fmod_sound, -1);
+                    let mut channel: *mut FMOD_CHANNEL = std::ptr::null_mut();
+                    if FMOD_System_PlaySound(
+                        *self.system,
+                        noise.fmod_sound,
+                        std::ptr::null_mut(),
+                        1,
+                        &mut channel,
+                    ) == FMOD_OK
+                        && !channel.is_null()
+                    {
+                        let _ = FMOD_Channel_SetMode(channel, FMOD_LOOP_NORMAL);
+                        let _ = FMOD_Channel_SetLoopCount(channel, -1);
+                        let _ = FMOD_Channel_SetVolume(channel, self.conf.noise_volume.max(0.0) as f32);
+                        let _ = FMOD_Channel_SetPitch(channel, self.conf.noise_speedhack as f32);
+                        let _ = FMOD_Channel_SetPaused(channel, 0);
+                        let _ = FMOD_System_Update(*self.system);
+                        self.fmod_noise_sound = channel;
+                    }
+                }
             }
         }
     }
@@ -1617,22 +1381,7 @@ impl Bot {
             },
         );
 
-        help_text(
-            ui,
-            "Use the internal audio engine for integration with internal recorders",
-            |ui| {
-                if ui.checkbox(&mut self.conf.use_fmod, "Use FMOD").changed() {
-                    if self.conf.use_fmod {
-                        log::info!("destroying kittyaudio mixer");
-                        self.mixer = Mixer::new();
-                    } else {
-                        self.maybe_init_kittyaudio();
-                    }
-                    self.play_noise();
-                }
-            },
-        );
-        ui.add_enabled_ui(!self.conf.use_fmod, |ui| self.show_device_switcher(ui));
+        ui.label("Audio backend: Geometry Dash FMOD (Android native)");
 
         ui.separator();
 
@@ -1856,8 +1605,6 @@ impl Bot {
         });
 
         ui.collapsing("Advanced", |ui| {
-            let last_bufsize = self.mixer.renderer.guard().last_buffer_size;
-            ui.label(format!("Real buffer size (kittyaudio): {last_bufsize}"));
             help_text(
                 ui,
                 "Keep playing noise even if the clickbot is disabled",
@@ -1865,67 +1612,13 @@ impl Bot {
                     ui.checkbox(&mut self.conf.play_noise_when_disabled, "Play noise when disabled");
                 },
             );
-
-            let prev_bufsize = self.conf.buffer_size;
-            help_text(
-                ui,
-                "Audio buffer size in samples. Lower value means lower latency.\n\
-                Click \"Apply\" below to apply changes (if any)",
-                |ui| {
-                    ui.label("Buffer size");
-                },
-            );
-            if u32_edit_field_min1(ui, &mut self.conf.buffer_size).changed() {
-                self.buffer_size_changed = prev_bufsize != self.conf.buffer_size;
-            }
-
-            if self.buffer_size_changed {
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Apply")
-                        .on_hover_text("Apply buffer size changes")
-                        .clicked()
-                    {
-                        if !self.conf.use_fmod {
-                            self.maybe_init_kittyaudio();
-                            self.play_noise();
-                        } else {
-                            self.show_fmod_buffersize_warn = true;
-                        }
-                        self.buffer_size_changed = false;
-                    }
-
-                    if self.conf.buffer_size > 300_000 {
-                        ui.label(
-                            RichText::new("WARN: Using a high buffer size might cause instability")
-                                .color(Color32::YELLOW),
-                        );
-                    }
-                });
-            }
-            if self.show_fmod_buffersize_warn && self.conf.buffer_size != self.startup_buffer_size {
-                ui.label(
-                    RichText::new("WARN: Restart the game to apply FMOD buffer size changes")
-                        .color(Color32::YELLOW),
-                );
-            }
-            if self.conf.use_fmod && self.startup_buffer_size < 10 {
-                ui.label(
-                    "If you don't hear any audio, it might be because your buffer size is set too low. \
-                    The recommended value for FMOD is 10."
-                );
-            }
         });
 
         ui.allocate_space(vec2(100.0, 0.0));
     }
 
     fn apply_config(&mut self) {
-        self.maybe_init_kittyaudio();
         self.play_noise();
-
-        #[cfg(not(feature = "geode"))]
-        self.maybe_alloc_console();
     }
 
     fn unload_clickpack(&mut self) {
@@ -1978,7 +1671,7 @@ impl Bot {
                 for dirname in &self.clickpacks {
                     let is_loading_clickpack = self.is_loading_clickpack.clone();
                     let load_for = self.conf.load_clickpack_for;
-                    let path = PathBuf::from(".zcb").join("clickpacks").join(dirname);
+                    let path = utils::zcb_path("clickpacks").join(dirname);
                     if ui
                         .selectable_label(&self.clickpack.name == dirname, dirname)
                         .clicked()
@@ -2013,41 +1706,13 @@ impl Bot {
             return true;
         }
         ui.horizontal(|ui| {
-            if ui
-                .button("Select clickpack")
-                .on_disabled_hover_text("Please wait…")
-                .clicked()
-            {
-                let is_loading_clickpack = self.is_loading_clickpack.clone();
-                let load_for = self.conf.load_clickpack_for;
-                let system = self.system;
-                std::thread::spawn(move || {
-                    let Some(dir) = FileDialog::new().pick_folder() else {
-                        return;
-                    };
-                    log::debug!("selected clickpack {dir:?}");
-                    Self::load_clickpack_thread(
-                        |e| {
-                            show_error_dialog(
-                                modal.clone(),
-                                "Failed to load clickpack!",
-                                &e.to_string(),
-                            );
-                        },
-                        &dir,
-                        is_loading_clickpack,
-                        load_for,
-                        *system,
-                    );
-                    unsafe {
-                        BOT.env.update(ClickpackEnv::Path(dir), load_for);
-                    }
-                });
-            }
             if self.clickpack.num_sounds != 0 {
                 ui.label(format!("Selected clickpack: \"{}\"", self.clickpack.name));
             } else {
-                ui.label("…or put clickpacks in .zcb/clickpacks");
+                ui.label(format!(
+                    "Put clickpacks in {} or use ClickpackDB",
+                    utils::zcb_path("clickpacks").display()
+                ));
             }
         });
         false
@@ -2106,18 +1771,17 @@ impl Bot {
                 );
             }
 
-            let show_open_folder = |ui: &mut egui::Ui| {
+            let open_folder_cb = self.open_folder_cb;
+            let show_open_folder = |ui: &mut egui::Ui, modal: Arc<Mutex<Modal>>| {
                 if ui
                     .button("Open folder")
                     .on_hover_text("Open .zcb/clickpacks")
                     .clicked()
                 {
-                    let _ = std::fs::create_dir_all(".zcb/clickpacks")
+                    let dir = utils::zcb_path("clickpacks");
+                    let _ = std::fs::create_dir_all(&dir)
                         .map_err(|e| log::error!("failed to create .zcb/clickpacks: {e}"));
-                    let _ = Command::new("explorer")
-                        .arg(".zcb\\clickpacks")
-                        .spawn()
-                        .map_err(|e| log::error!("failed to open .zcb/clickpacks: {e}"));
+                    Self::open_folder_in_geode(open_folder_cb, &dir, modal);
                 }
             };
 
@@ -2125,7 +1789,7 @@ impl Bot {
 
             let mut is_combobox = false;
             ui.horizontal(|ui| {
-                is_combobox = self.select_clickpack_button(ui, modal);
+                is_combobox = self.select_clickpack_button(ui, modal.clone());
                 if !self.clickpack.name.is_empty() {
                     ui.style_mut().spacing.item_spacing.x = 4.0;
                     if ui.button("🗙").on_hover_text("Unload clickpack").clicked() {
@@ -2134,11 +1798,11 @@ impl Bot {
                     }
                 }
                 if is_combobox {
-                    show_open_folder(ui);
+                    show_open_folder(ui, modal.clone());
                 }
             });
             if !is_combobox {
-                show_open_folder(ui);
+                show_open_folder(ui, modal.clone());
             }
         });
 
@@ -2231,7 +1895,19 @@ impl Bot {
                 .reload_clickpacks()
                 .map_err(|e| log::error!("failed to reload clickpacks for clickpackdb: {e}"));
         }
+        let screen_size = ctx.screen_rect().size();
+        let max_win_size = vec2(
+            (screen_size.x - 24.0).max(200.0),
+            (screen_size.y - 24.0).max(200.0),
+        );
+        let default_db_size = vec2(
+            (screen_size.x * 0.80).clamp(260.0, 560.0),
+            (screen_size.y * 0.80).clamp(240.0, 520.0),
+        );
         egui::Window::new("ClickpackDB")
+            .constrain(true)
+            .default_size(default_db_size)
+            .max_size(max_win_size)
             .open(&mut self.clickpack_db_open)
             .show(ctx, |ui| {
                 self.clickpack_db.show(ui, &ureq_get);

@@ -24,3 +24,12 @@ Join the Discord server for support, clickpacks, video sharing, ...
 
 - https://discord.gg/clickbot
 - https://discord.gg/BRVVVzxESu
+
+# Android64 Port
+
+- **Target platform**: Android64 (`arm64-v8a` / `aarch64-linux-android`)
+- **Geometry Dash**: `2.2081`
+- **Geode SDK**: `5.11.2`
+- **Minimum Android OS**: Android 6.0 (API level 23, enforced by Geode SDK 5.11.2)
+- **Overlay control**: Tap the draggable `ZCB` button on screen (or press `1` on a hardware keyboard) to toggle the menu.
+
